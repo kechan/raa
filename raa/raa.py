@@ -54,12 +54,14 @@ class RAA:
   def test_health(self) -> bool:
     '''
     A quick simple test to see if the openai api endpoint for chat completion is working.
-    Use the cheapest model, short prompt, and max_tokens=2
+    Use the configured model (or gpt-4o as default), short prompt, and max_tokens=2
     '''
     try:
+      model_name = self.llm_model if self.llm_model is not None else 'gpt-4o'
+
       messages = [{"role": "system", "content": "Hello"}, {"role": "user", "content": "Hi"}]
       if self.openai_version == ">=1.3.0":
-        response = self.client.chat.completions.create(model='gpt-3.5-turbo',
+        response = self.client.chat.completions.create(model=model_name,
                                     messages=messages,
                                     temperature=0.0,
                                     max_tokens=2,
@@ -67,7 +69,7 @@ class RAA:
 
         content = response.choices[0].message.content
       else:
-        response = openai.ChatCompletion.create(model='gpt-3.5-turbo',
+        response = openai.ChatCompletion.create(model=model_name,
                                     messages=messages,
                                     temperature=0.0,
                                     max_tokens=2,
