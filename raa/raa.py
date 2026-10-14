@@ -1,5 +1,5 @@
 from typing import List, Dict
-import os, openai, tiktoken
+import os, logging, openai, tiktoken
 import pkg_resources
 import openai
 try:
@@ -17,8 +17,29 @@ AVAILABLE_GPT_MODELS = ['gpt-3.5-turbo-0613',
                         'gpt-4-1106-preview',
                         'gpt-4-0125-preview',
                         'gpt-4o',
-                        'gpt-5.6-luna'
+                        'gpt-5.6-luna',
+                        'gpt-6-luna'
                         ]
+
+logger = logging.getLogger(__name__)
+
+def _is_legacy_model(model) -> bool:
+  '''
+  gpt-4o and older (gpt-3.5*, gpt-4*) take max_tokens and reject reasoning_effort.
+  gpt-5.6-luna and newer are reasoning models: they reject max_tokens and take max_completion_tokens
+  (which also counts hidden reasoning tokens) plus reasoning_effort.
+  '''
+  return model.startswith(('gpt-3', 'gpt-4'))
+
+def _completion_params(model, max_tokens=None) -> dict:
+  '''Model-specific kwargs for chat completion calls (everything except model, messages, temperature).'''
+  if _is_legacy_model(model):
+    return {} if max_tokens is None else {'max_tokens': max_tokens}
+
+  params = {'reasoning_effort': 'low'}
+  if max_tokens is not None:
+    params['max_completion_tokens'] = max_tokens
+  return params
 
 class RAA:
   def __init__(self, llm_model=None, sys_prompt=None, api_key_env_var: str = 'OPENAI_API_KEY'):
@@ -55,35 +76,39 @@ class RAA:
   def test_health(self) -> bool:
     '''
     A quick simple test to see if the openai api endpoint for chat completion is working.
-    Use the configured model (or gpt-4o as default), short prompt, and max_tokens=2
+    Use the configured model (or gpt-4o as default), short prompt, and a tiny output cap.
     '''
     try:
       model_name = self.llm_model if self.llm_model is not None else 'gpt-4o'
 
       messages = [{"role": "system", "content": "Hello"}, {"role": "user", "content": "Hi"}]
-      if self.openai_version == ">=1.3.0":
-        response = self.client.chat.completions.create(model=model_name,
-                                    messages=messages,
-                                    temperature=0.0,
-                                    max_tokens=2,
-                                    )
-
-        content = response.choices[0].message.content
+      if _is_legacy_model(model_name):
+        params = {'temperature': 0.0, 'max_tokens': 2}   # gpt-4o returns truncated text (e.g. "Hello!") at the cap
       else:
-        response = openai.ChatCompletion.create(model=model_name,
-                                    messages=messages,
-                                    temperature=0.0,
-                                    max_tokens=2,
-                                    )
-        content = response.choices[0].message["content"]                                    
-                                  
+        # reasoning_effort='none' is what allows temperature=0.0 (otherwise only 1 is accepted).
+        # The cap must fit the whole reply (~10 tokens, "Hi! How can I help?"): unlike gpt-4o, these models
+        # raise an error instead of returning truncated text when the cap is hit.
+        params = {'temperature': 0.0, 'reasoning_effort': 'none', 'max_completion_tokens': 20}
+
+      if self.openai_version == ">=1.3.0":
+        response = self.client.chat.completions.create(model=model_name, messages=messages, **params)
+        content = response.choices[0].message.content
+        finish_reason = response.choices[0].finish_reason
+      else:
+        response = openai.ChatCompletion.create(model=model_name, messages=messages, **params)
+        content = response.choices[0].message["content"]
+        finish_reason = response.choices[0]["finish_reason"]
+
       print(content)
-      if len(content) > 0:   # this could be "Hello!"
+      if content is not None and len(content) > 0:   # this could be "Hello!"
+        logger.info(f"OpenAI health check ok ({model_name}): {content!r}")
         return True
       else:
+        logger.error(f"OpenAI health check ({model_name}) returned empty content, finish_reason={finish_reason}")
         return False
     except Exception as e:
       print(f"Exception: {e}")
+      logger.error(f"OpenAI health check ({model_name}) failed: {e}")
       return False
 
   def get_openai_api_key(self):
@@ -161,8 +186,8 @@ def _openai_ChatCompletion_newer_than_1d3d0(client, messages: List[Dict], model,
         model=model,
         messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
-    )      
+        **_completion_params(model, max_tokens),
+    )
     return response.choices[0].message.content
 
     # TODO: error handling generalized to particular error messages
@@ -201,19 +226,13 @@ def _openai_ChatCompletion_older_than_1d3d0(messages: List[Dict], model, tempera
 
   # use older API
   try:
-    if max_tokens is None:    # assuem openai default
-      response = openai.ChatCompletion.create(
-          model=model,
-          messages=messages,
-          temperature=temperature,
-      )
-    else:
-      response = openai.ChatCompletion.create(
-          model=model,
-          messages=messages,
-          temperature=temperature,
-          max_tokens=max_tokens,
-      )
+    # max_tokens None -> no cap passed, assume openai default
+    response = openai.ChatCompletion.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        **_completion_params(model, max_tokens),
+    )
     return response.choices[0].message["content"]
 
   # TODO: error handling generalized to particular error messages 
